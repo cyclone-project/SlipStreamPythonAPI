@@ -7,6 +7,9 @@ import uuid
 import logging
 
 import requests
+from requests.cookies import MockRequest
+from requests.exceptions import HTTPError
+
 from six import string_types, integer_types
 from six.moves.urllib.parse import urlparse
 from six.moves.http_cookiejar import MozillaCookieJar
@@ -14,19 +17,15 @@ from six.moves.http_cookiejar import MozillaCookieJar
 from . import models
 
 try:
-    from defusedxml import cElementTree as etree
+    from xml.etree import cElementTree as etree
 except ImportError:
-    from defusedxml import ElementTree as etree
-
-try:
-    import xml.etree.cElementTree as ET
-except ImportError:
-    import xml.etree.ElementTree as ET
+    from xml.etree import ElementTree as etree
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = 'https://nuv.la'
 DEFAULT_COOKIE_FILE = os.path.expanduser('~/.slipstream/cookies.txt')
+
 
 def _mod_url(path):
     parts = path.strip('/').split('/')
@@ -49,23 +48,26 @@ def get_module_type(category):
     return mapping.get(category.lower(), category.lower())
 
 
-def ElementTree__iter(root):
+def element_tree__iter(root):
     return getattr(root, 'iter',  # Python 2.7 and above
                    root.getiterator)  # Python 2.6 compatibility
 
 
 class SlipStreamError(Exception):
-
-    def __init__(self, reason):
+    def __init__(self, reason, response=None):
         super(SlipStreamError, self).__init__(reason)
         self.reason = reason
+        self.response = response
 
 
 class SessionStore(requests.Session):
     """A ``requests.Session`` subclass implementing a file-based session store."""
 
-    def __init__(self, cookie_file=None):
+    def __init__(self, endpoint, reauthenticate, cookie_file=None):
         super(SessionStore, self).__init__()
+        self.session_base_url = '{}/api/session'.format(endpoint)
+        self.reauthenticate = reauthenticate
+        self.login_params = None
         if cookie_file is None:
             cookie_file = DEFAULT_COOKIE_FILE
         cookie_dir = os.path.dirname(cookie_file)
@@ -78,10 +80,43 @@ class SessionStore(requests.Session):
             self.cookies.load(ignore_discard=True)
             self.cookies.clear_expired_cookies()
 
+    def need_to_login(self, accessed_url, status_code):
+        return self.reauthenticate and status_code in [401, 403] and accessed_url != self.session_base_url
+
+
     def request(self, *args, **kwargs):
-        response = super(SessionStore, self).request(*args, **kwargs)
+        super_request = super(SessionStore, self).request
+        response = super_request(*args, **kwargs)
+
+        if not self.verify and response.cookies:
+            self._unsecure_cookie(args[1], response)
         self.cookies.save(ignore_discard=True)
+
+        url = args[1]
+        if self.need_to_login(url, response.status_code):
+            login_response = self.cimi_login(self.login_params)
+            if login_response is not None and login_response.status_code == 201:
+                # retry the call after reauthentication
+                response = super_request(*args, **kwargs)
+
         return response
+
+    def cimi_login(self, login_params):
+        self.login_params = login_params
+        if self.login_params:
+            return self.request('POST', self.session_base_url,
+                                headers={'Content-Type': 'application/json',
+                                         'Accept': 'application/json'},
+                                json={'sessionTemplate': login_params})
+        else:
+            return None
+
+    def _unsecure_cookie(self, url_str, response):
+        url = urlparse(url_str)
+        if url.scheme == 'http':
+            for cookie in response.cookies:
+                cookie.secure = False
+                self.cookies.set_cookie_if_ok(cookie, MockRequest(response.request))
 
     def clear(self, domain):
         """Clear cookies for the specified domain."""
@@ -97,38 +132,113 @@ class Api(object):
 
     GLOBAL_PARAMETERS = ['bypass-ssh-check', 'refqname', 'keep-running', 'tags', 'mutable', 'type']
     KEEP_RUNNING_VALUES = ['always', 'never', 'on-success', 'on-error']
+    CIMI_PARAMETERS_NAME = ['first', 'last', 'filter', 'select', 'expand', 'orderby', 'aggregation']
 
-    def __init__(self, endpoint=None, cookie_file=None, insecure=False):
-        self.endpoint = DEFAULT_ENDPOINT if endpoint is None else endpoint
-        self.session = SessionStore(cookie_file)
+    def __init__(self, endpoint=DEFAULT_ENDPOINT, cookie_file=None, insecure=False, reauthenticate=False):
+        self.endpoint = endpoint
+        self.session = SessionStore(endpoint, reauthenticate, cookie_file=cookie_file)
         self.session.verify = (insecure == False)
         self.session.headers.update({'Accept': 'application/xml'})
         if insecure:
-            requests.packages.urllib3.disable_warnings(
-                requests.packages.urllib3.exceptions.InsecureRequestWarning)
-        self.username = None
+            try:
+                requests.packages.urllib3.disable_warnings(
+                    requests.packages.urllib3.exceptions.InsecureRequestWarning)
+            except:
+                import urllib3
+                urllib3.disable_warnings(
+                    urllib3.exceptions.InsecureRequestWarning)
+        self._username = None
+        self._cimi_cloud_entry_point = None
 
-    def login(self, username, password):
+    def login(self, login_params):
+        """Uses given 'login_params' to log into the SlipStream server. The
+        'login_params' must be a map containing an "href" element giving the id of
+        the sessionTemplate resource and any other attributes required for the
+        login method. E.g.:
+
+        {"href" : "session-template/internal",
+         "username" : "username",
+         "password" : "password"}
+         or
+        {"href" : "session-template/api-key",
+         "key" : "key",
+         "secret" : "secret"}
+
+        Returns server response as dict. Successful responses will contain a
+        `status` code of 201 and the `resource-id` of the created session.
+
+        :param   login_params: {"href": "session-template/...", <creds>}
+        :type    login_params: dict
+        :return: Server response.
+        :rtype:  dict
+
         """
+        return self.session.cimi_login(login_params)
 
-        :param username: 
-        :param password: 
+    def login_internal(self, username, password):
+        """Login to the server using username and password.
 
+        :param username:
+        :param password:
+        :return: see login()
         """
-        self.username = username
+        self._username = username
+        return self.login({'href': 'session-template/internal',
+                           'username': username,
+                           'password': password})
 
-        response = self.session.post('%s/auth/login' % self.endpoint, data={
-            'username': username,
-            'password': password
-        })
-        response.raise_for_status()
+    def login_apikey(self, key, secret):
+        """Login to the server using API key/secret pair.
+
+        :param key: The Key ID (resource id).
+                    (example: credential/ce02ef40-1342-4e68-838d-e1b2a75adb1e)
+        :param secret: The Secret Key corresponding to the Key ID
+        :return: see login()
+        """
+        return self.login({'href': 'session-template/api-key',
+                           'key': key,
+                           'secret': secret})
 
     def logout(self):
-        """ """
-        response = self.session.get('%s/logout' % self.endpoint)
+        """Logs user out by deleting session.
+        """
+        session_id = self.current_session()
+        if session_id is not None:
+            self._cimi_delete(session_id)
+        self.session.login_params = None
+        self._username = None
+
+    def current_session(self):
+        """Returns current user session or None.
+
+        :return: Current user session.
+        :rtype: str
+        """
+        resource_type = 'sessions'
+        session = self.cimi_search(resource_type)
+        if session and session.count > 0:
+            return session.sessions[0].get('id')
+        else:
+            return None
+
+    def is_authenticated(self):
+        return self.current_session() is not None
+
+    @property
+    def username(self):
+        if not self._username:
+            session_id = self.current_session()
+            if session_id:
+                self._username = self.cimi_get(session_id).json.get('username')
+        return self._username
+
+    def _text_get(self, url, **params):
+        response = self.session.get('%s%s' % (self.endpoint, url),
+                                    headers={'Accept': 'text/plain'},
+                                    params=params)
         response.raise_for_status()
-        url = urlparse(self.endpoint)
-        self.session.clear(url.netloc)
+
+        return response.text.encode('utf-8')
 
     def _xml_get(self, url, **params):
         response = self.session.get('%s%s' % (self.endpoint, url),
@@ -136,7 +246,7 @@ class Api(object):
                                     params=params)
         response.raise_for_status()
 
-        parser = etree.DefusedXMLParser(encoding='utf-8')
+        parser = etree.XMLParser(encoding='utf-8')
         parser.feed(response.text.encode('utf-8'))
         return parser.close()
 
@@ -146,12 +256,24 @@ class Api(object):
                                          'Content-Type': 'application/xml'},
                                 data=data)
 
-    def _json_get(self, url, **params):
-        response = self.session.get('%s%s' % (self.endpoint, url),
-                                    headers={'Accept': 'application/json'},
-                                    params=params)
-        response.raise_for_status()
-        return response.json()
+    def _get_user_xml(self, username):
+        if not username:
+            username = self.username
+
+        try:
+            return self._xml_get('/user/%s' % username)
+        except requests.HTTPError as e:
+            if e.response.status_code == 403:
+                logger.debug("Access denied for user: {0}.")
+            raise
+
+    def _list_users_xml(self):
+        try:
+            return self._xml_get('/users')
+        except requests.HTTPError as e:
+            if e.response.status_code == 403:
+                logger.debug("Access denied for users.")
+            raise
 
     @staticmethod
     def _add_to_dict_if_not_none(d, key, value):
@@ -160,7 +282,211 @@ class Api(object):
 
     @staticmethod
     def _dict_values_to_string(d):
-        return {k: v if isinstance(v, six.string_types) else str(v) for k,v in six.iteritems(d)}
+        return {k: v if isinstance(v, six.string_types) else str(v) for k, v in six.iteritems(d)}
+
+    @staticmethod
+    def _flatten_cloud_parameters(cloud_parameters):
+        parameters = {}
+        if cloud_parameters is not None:
+            for cloud, params in six.iteritems(cloud_parameters):
+                for name, value in six.iteritems(params):
+                    parameters['{}.{}'.format(cloud, name)] = value
+        return parameters
+
+    @staticmethod
+    def _create_xml_parameter_entry(name, value):
+        category = name.split('.', 1)[0]
+        entry_xml = etree.Element('entry')
+        etree.SubElement(entry_xml, 'string').text = name
+        param_xml = etree.SubElement(entry_xml, 'parameter', name=name, category=category)
+        etree.SubElement(param_xml, 'value').text = value
+        return entry_xml
+
+    @staticmethod
+    def _check_xml_result(response):
+        if not (200 <= response.status_code < 300):
+            try:
+                reason = etree.fromstring(response.text).get('detail')
+            except:
+                pass
+            else:
+                raise SlipStreamError(reason)
+        response.raise_for_status()
+
+    def _cimi_get_cloud_entry_point(self):
+        cep_json = self._cimi_get('cloud-entry-point')
+        return models.CloudEntryPoint(cep_json)
+
+    @property
+    def cimi_cloud_entry_point(self):
+        if self._cimi_cloud_entry_point is None:
+            self._cimi_cloud_entry_point = self._cimi_get_cloud_entry_point()
+        return self._cimi_cloud_entry_point
+
+    @classmethod
+    def _split_cimi_params(cls, params):
+        cimi_params = {}
+        other_params = {}
+        for key, value in params.items():
+            if key in cls.CIMI_PARAMETERS_NAME:
+                cimi_params['$' + key] = value
+            else:
+                other_params[key] = value
+        return cimi_params, other_params
+
+    @staticmethod
+    def _cimi_find_operation_href(cimi_resource, operation):
+        operation_href = cimi_resource.operations_by_name.get(operation, {}).get('href')
+
+        if not operation_href:
+            raise KeyError("Operation '{}' not found.".format(operation))
+
+        return operation_href
+
+    def _cimi_get_uri(self, resource_id=None, resource_type=None):
+        if resource_id is None and resource_type is None:
+            raise TypeError("You have to specify 'resource_uri' or 'resource_type'.")
+
+        if resource_id is not None and resource_type is not None:
+            raise TypeError("You can only specify 'resource_uri' or 'resource_type', not both.")
+
+        if resource_type is not None:
+            resource_id = self.cimi_cloud_entry_point.entry_points.get(resource_type)
+            if resource_id is None:
+                raise KeyError("Resource type '{}' not found.".format(resource_type))
+
+        return resource_id
+
+    def _cimi_request(self, method, uri, params=None, json=None, data=None):
+        response = self.session.request(method, '{}/{}/{}'.format(self.endpoint, 'api', uri),
+                                        headers={'Accept': 'application/json'},
+                                        params=params,
+                                        json=json,
+                                        data=data)
+        try:
+            response.raise_for_status()
+        except HTTPError as e:
+            try:
+                json_msg = e.response.json()
+                message = json_msg.get('message')
+                if message is None:
+                    error = json_msg.get('error')
+                    message = error.get('code') + ' - ' + error.get('reason')
+            except:
+                try:
+                    message = e.response.text
+                except:
+                    message = str(e)
+            raise SlipStreamError(message, response)
+
+        return response.json()
+
+    def _cimi_get(self, resource_id=None, resource_type=None, params=None):
+        uri = self._cimi_get_uri(resource_id, resource_type)
+        return self._cimi_request('GET', uri, params=params)
+
+    def _cimi_post(self, resource_id=None, resource_type=None, params=None, json=None, data=None):
+        uri = self._cimi_get_uri(resource_id, resource_type)
+        return self._cimi_request('POST', uri, params=params, json=json, data=data)
+
+    def _cimi_put(self, resource_id=None, resource_type=None, params=None, json=None, data=None):
+        uri = self._cimi_get_uri(resource_id, resource_type)
+        return self._cimi_request('PUT', uri, params=params, json=json, data=data)
+
+    def _cimi_delete(self, resource_id=None):
+        return self._cimi_request('DELETE', resource_id)
+
+    def cimi_get(self, resource_id):
+        """ Retreive a CIMI resource by it's resource id
+
+        :param      resource_id: The id of the resource to retrieve
+        :type       resource_id: str
+
+        :return:    A CimiResource object corresponding to the resource
+        """
+        resp_json = self._cimi_get(resource_id=resource_id)
+        return models.CimiResource(resp_json)
+
+    def cimi_edit(self, resource_id, data):
+        """ Edit a CIMI resource by it's resource id
+
+        :param      resource_id: The id of the resource to edit
+        :type       resource_id: str
+
+        :param      data: The data to serialize into JSON
+        :type       data: dict
+
+        :return:    A CimiResponse object which should contain the attributes 'status', 'resource-id' and 'message'
+        :rtype:     CimiResponse
+        """
+        resource = self.cimi_get(resource_id=resource_id)
+        operation_href = self._cimi_find_operation_href(resource, 'edit')
+        return models.CimiResponse(self._cimi_put(resource_id=operation_href, json=data))
+
+    def cimi_delete(self, resource_id):
+        """ Delete a CIMI resource by it's resource id
+
+        :param  resource_id: The id of the resource to delete
+        :type   resource_id: str
+
+        :return:    A CimiResponse object which should contain the attributes 'status', 'resource-id' and 'message'
+        :rtype:     CimiResponse
+
+        """
+        resource = self.cimi_get(resource_id=resource_id)
+        operation_href = self._cimi_find_operation_href(resource, 'delete')
+        return models.CimiResponse(self._cimi_delete(resource_id=operation_href))
+
+    def cimi_add(self, resource_type, data):
+        """ Add a CIMI resource to the specified resource_type (Collection)
+
+        :param      resource_type: Type of the resource (Collection name)
+        :type       resource_type: str
+
+        :param      data: The data to serialize into JSON
+        :type       data: dict
+
+        :return:    A CimiResponse object which should contain the attributes 'status', 'resource-id' and 'message'
+        :rtype:     CimiResponse
+        """
+        collection = self.cimi_search(resource_type=resource_type, last=0)
+        operation_href = self._cimi_find_operation_href(collection, 'add')
+        return models.CimiResponse(self._cimi_post(resource_id=operation_href, json=data))
+
+    def cimi_search(self, resource_type, **kwargs):
+        """ Search for CIMI resources of the given type (Collection).
+
+        :param      resource_type: Type of the resource (Collection name)
+        :type       resource_type: str
+
+        :keyword    first: Start from the 'first' element (1-based)
+        :type       first: int
+
+        :keyword    last: Stop at the 'last' element (1-based)
+        :type       last: int
+
+        :keyword    filter: CIMI filter
+        :type       filter: str
+
+        :keyword    select: Select attributes to return. (resourceURI always returned)
+        :type       select: str or list of str
+
+        :keyword    expand: Expand linked resources (not implemented yet)
+        :type       expand: str or list of str
+
+        :keyword    orderby: Sort by the specified attribute
+        :type       orderby: str or list of str
+
+        :keyword    aggregation: CIMI aggregation
+        :type       aggregation: str (operator:field)
+
+        :return:    A CimiCollection object with the list of found resources available
+                    as a generator with the method 'resources()' or with the attribute 'resources_list'
+        :rtype:     CimiCollection
+        """
+        cimi_params, query_params = self._split_cimi_params(kwargs)
+        resp_json = self._cimi_put(resource_type=resource_type, data=cimi_params, params=query_params)
+        return models.CimiCollection(resp_json, resource_type)
 
     def create_user(self, username, password, email, first_name, last_name,
                     organization=None, roles=None, privileged=False,
@@ -208,6 +534,7 @@ class Api(object):
         :type cloud_parameters: dict|None
 
         """
+
         attrib = dict(name=username, password=password, email=email,
                       firstName=first_name, lastName=last_name,
                       issuper=privileged,
@@ -216,11 +543,7 @@ class Api(object):
         self._add_to_dict_if_not_none(attrib, 'roles', roles)
         _attrib = self._dict_values_to_string(attrib)
 
-        parameters = {}
-        if cloud_parameters is not None:
-            for cloud, params in six.iteritems(cloud_parameters):
-                for name, value in six.iteritems(params):
-                    parameters['{}.{}'.format(cloud, name)] = value
+        parameters = self._flatten_cloud_parameters(cloud_parameters)
 
         self._add_to_dict_if_not_none(parameters, 'General.default.cloud.service', default_cloud)
         self._add_to_dict_if_not_none(parameters, 'General.keep-running', default_keep_running)
@@ -231,27 +554,82 @@ class Api(object):
 
         _parameters = self._dict_values_to_string(parameters)
 
-        user_xml = ET.Element('user', **_attrib)
+        user_xml = etree.Element('user', **_attrib)
 
-        params_xml = ET.SubElement(user_xml, 'parameters')
+        params_xml = etree.SubElement(user_xml, 'parameters')
         for name, value in six.iteritems(_parameters):
-            category = name.split('.', 1)[0]
-            entry_xml = ET.SubElement(params_xml, 'entry')
-            ET.SubElement(entry_xml, 'string').text = name
-            param_xml = ET.SubElement(entry_xml, 'parameter', name=name, category=category)
-            ET.SubElement(param_xml, 'value').text = value
+            params_xml.append(self._create_xml_parameter_entry(name, value))
 
         response = self._xml_put('/user/{}'.format(username), etree.tostring(user_xml, 'UTF-8'))
 
-        if not (200 <= response.status_code < 300):
-            reason = ''
-            try:
-                reason = etree.fromstring(response.text).get('detail')
-            except:
-                pass
-            else:
-                raise SlipStreamError(reason)
-        response.raise_for_status()
+        self._check_xml_result(response)
+
+        return True
+
+    def update_user(self, username=None,
+                    password=None, email=None, first_name=None, last_name=None,
+                    organization=None, roles=None, privileged=None,
+                    default_cloud=None, default_keep_running=None,
+                    ssh_public_keys=None, log_verbosity=None, execution_timeout=None,
+                    usage_email=None, cloud_parameters=None):
+        """
+        Update an existing user in SlipStream.
+        Any parameter provided will be updated, others parameters will not be touched.
+
+        Parameters are identical to the ones of the method 'create_user' except that they can all be None.
+
+        Username cannot be updated.
+        This parameter define which user to update.
+        If not provided or None the current user will be used
+        """
+        root = self._get_user_xml(username)
+
+        if 'roles' in root.attrib and not self.get_user().privileged:
+            del root.attrib['roles']
+
+        attrib = {}
+        self._add_to_dict_if_not_none(attrib, 'email', email)
+        self._add_to_dict_if_not_none(attrib, 'roles', roles)
+        self._add_to_dict_if_not_none(attrib, 'password', password)
+        self._add_to_dict_if_not_none(attrib, 'issuper', privileged)
+        self._add_to_dict_if_not_none(attrib, 'lastName', last_name)
+        self._add_to_dict_if_not_none(attrib, 'firstName', first_name)
+        self._add_to_dict_if_not_none(attrib, 'organization', organization)
+        _attrib = self._dict_values_to_string(attrib)
+
+        parameters = self._flatten_cloud_parameters(cloud_parameters)
+        self._add_to_dict_if_not_none(parameters, 'General.default.cloud.service', default_cloud)
+        self._add_to_dict_if_not_none(parameters, 'General.keep-running', default_keep_running)
+        self._add_to_dict_if_not_none(parameters, 'General.Verbosity Level', log_verbosity)
+        self._add_to_dict_if_not_none(parameters, 'General.Timeout', execution_timeout)
+        self._add_to_dict_if_not_none(parameters, 'General.mail-usage', usage_email)
+        self._add_to_dict_if_not_none(parameters, 'General.ssh.public.key', ssh_public_keys)
+        _parameters = self._dict_values_to_string(parameters)
+
+        for key, val in six.iteritems(_attrib):
+            root.set(key, val)
+
+        for key, val in six.iteritems(_parameters):
+            param_xml = root.find('parameters/entry/parameter[@name="' + key + '"]')
+            if param_xml is None:
+                param_entry_xml = self._create_xml_parameter_entry(key, val)
+                param_xml = param_entry_xml.find('parameter')
+                root.find('parameters').append(param_entry_xml)
+
+            value_xml = param_xml.find('value')
+            if value_xml is None:
+                value_xml = etree.SubElement(param_xml, 'value')
+            value_xml.text = val
+
+        parameters_xml = root.find('parameters')
+        for entry in parameters_xml.findall('entry'):
+            param = entry.find('parameter[@name="General.orchestrator.publicsshkey"]')
+            if param:
+                parameters_xml.remove(entry)
+
+        response = self._xml_put('/user/{}'.format(root.get('name')), etree.tostring(root, 'UTF-8'))
+
+        self._check_xml_result(response)
 
         return True
 
@@ -260,17 +638,8 @@ class Api(object):
         Get informations for a given user, if permitted
         :param username: The username of the user.
                          Default to the user logged in if not provided or None.
-        :type path: str|None
         """
-        if not username:
-            username = self.username
-
-        try:
-            root = self._xml_get('/user/%s' % username)
-        except requests.HTTPError as e:
-            if e.response.status_code == 403:
-                logger.debug("Access denied for user: {0}.")
-            raise
+        root = self._get_user_xml(username)
 
         general_params = {}
         with_username = set()
@@ -293,30 +662,52 @@ class Api(object):
         user = models.User(
             username=root.get('name'),
             cyclone_login=root.get('cycloneLogin'),
+            github_login=root.get('githubLogin'),
             email=root.get('email'),
             first_name=root.get('firstName'),
             last_name=root.get('lastName'),
             organization=root.get('organization'),
+            roles=root.get('roles', '').split(','),
             configured_clouds=configured_clouds,
             default_cloud=general_params.get('General.default.cloud.service'),
             ssh_public_keys=general_params.get('General.ssh.public.key', '').splitlines(),
             keep_running=general_params.get('General.keep-running'),
             timeout=general_params.get('General.Timeout'),
-            privileged=root.get('issuper').lower() == "true",
-        )
+            privileged=root.get('issuper', "false").lower() == "true",
+            active_since=root.get('activeSince'),
+            last_online=root.get('lastOnline'),
+            online=root.get('online'))
+
         return user
+
+    def list_users(self):
+        """
+        List users (requires privileged access)
+        """
+        root = self._list_users_xml()
+        for elem in element_tree__iter(root)('item'):
+            yield models.UserItem(username=elem.get('name'),
+                                  email=elem.get('email'),
+                                  first_name=elem.get('firstName'),
+                                  last_name=elem.get('lastName'),
+                                  organization=elem.get('organization'),
+                                  roles=elem.get('roles', '').split(','),
+                                  privileged=elem.get('issuper', "false").lower() == "true",
+                                  active_since=elem.get('activeSince'),
+                                  last_online=elem.get('lastOnline'),
+                                  online=elem.get('online'))
 
     def list_applications(self):
         """
         List apps in the appstore
         """
         root = self._xml_get('/appstore')
-        for elem in ElementTree__iter(root)('item'):
+        for elem in element_tree__iter(root)('item'):
             yield models.App(name=elem.get('name'),
                              type=get_module_type(elem.get('category')),
                              version=int(elem.get('version')),
                              path=_mod(elem.get('resourceUri'),
-                                      with_version=False))
+                                       with_version=False))
 
     def get_element(self, path):
         """
@@ -334,15 +725,15 @@ class Api(object):
                 logger.debug("Access denied for path: {0}. Skipping.".format(path))
             raise
 
-        module = models.Module(name=root.get('shortName'),
-                               type=get_module_type(root.get('category')),
-                               created=root.get('creation'),
-                               modified=root.get('lastModified'),
-                               description=root.get('description'),
-                               version=int(root.get('version')),
-                               path=_mod('%s/%s' % (root.get('parentUri').strip('/'),
-                                                   root.get('shortName'))))
-        return module
+        ss_module = models.Module(name=root.get('shortName'),
+                                  type=get_module_type(root.get('category')),
+                                  created=root.get('creation'),
+                                  modified=root.get('lastModified'),
+                                  description=root.get('description'),
+                                  version=int(root.get('version')),
+                                  path=_mod('%s/%s' % (root.get('parentUri').strip('/'),
+                                                       root.get('shortName'))))
+        return ss_module
 
     def get_application_nodes(self, path):
         """
@@ -370,7 +761,6 @@ class Api(object):
                               extra_disk_volatile=node.get('extraDiskVolatile'),
                               )
 
-
     def list_project_content(self, path=None, recurse=False):
         """
         List the content of a project
@@ -397,7 +787,7 @@ class Api(object):
                 return
             raise
 
-        for elem in ElementTree__iter(root)('item'):
+        for elem in element_tree__iter(root)('item'):
             # Compute module path
             if elem.get('resourceUri'):
                 app_path = elem.get('resourceUri')
@@ -419,24 +809,39 @@ class Api(object):
                 for app in self.list_project_content(app_path, recurse):
                     yield app
 
-    def list_deployments(self, inactive=False):
+    def list_deployments(self, inactive=False, cloud=None, offset=0, limit=20):
         """
         List deployments
 
         :param inactive: Include inactive deployments. Default to False
+        :type cloud: bool
+
+        :param cloud: Retrieve only deployments for the specified Cloud
+        :type cloud: str
+
+        :param offset: Retrieve deployments starting by the offset<exp>th</exp> one. Default to 0
+        :type offset: int
+
+        :param limit: Retrieve at most 'limit' deployments. Default to 20
+        :type limit: int
 
         """
-        root = self._xml_get('/run', activeOnly=(not inactive))
-        for elem in ElementTree__iter(root)('item'):
+        _cloud = ''
+        if cloud is not None:
+            _cloud = cloud
+
+        root = self._xml_get('/run', activeOnly=(not inactive), offset=offset, limit=limit, cloud=_cloud)
+        for elem in element_tree__iter(root)('item'):
             yield models.Deployment(id=uuid.UUID(elem.get('uuid')),
                                     module=_mod(elem.get('moduleResourceUri')),
                                     status=elem.get('status').lower(),
                                     started_at=elem.get('startTime'),
                                     last_state_change=elem.get('lastStateChangeTime'),
-                                    clouds=elem.get('cloudServiceNames'),
+                                    clouds=elem.get('cloudServiceNames', '').split(','),
                                     username=elem.get('username'),
                                     abort=elem.get('abort'),
                                     service_url=elem.get('serviceUrl'),
+                                    scalable=elem.get('mutable'),
                                     )
 
     def get_deployment(self, deployment_id):
@@ -457,27 +862,56 @@ class Api(object):
                                  status=root.get('state').lower(),
                                  started_at=root.get('startTime'),
                                  last_state_change=root.get('lastStateChangeTime'),
-                                 clouds=root.get('cloudServiceNames','').split(','),
+                                 clouds=root.get('cloudServiceNames', '').split(','),
                                  username=root.get('user'),
                                  abort=abort,
                                  service_url=service_url,
+                                 scalable=root.get('mutable'),
                                  )
 
-    def list_virtualmachines(self, deployment_id=None, offset=0, limit=20):
+    def get_deployment_parameter(self, deployment_id, parameter_name, ignore_abort=False):
+        """
+        Get a parameter of a deployment
+
+        :param deployment_id: The deployment UUID of the deployment to get
+        :type deployment_id: str or UUID
+
+        :param parameter_name: The parameter name (eg: ss:state)
+        :type parameter_name: str
+
+        :param ignore_abort: If False, raise an exception if the deployment has failed
+        :type ignore_abort: bool
+        """
+        ignoreabort = str(ignore_abort).lower()
+        return self._text_get('/run/{}/{}'.format(str(deployment_id), parameter_name),
+                              ignoreabort=ignoreabort)
+
+    def list_virtualmachines(self, deployment_id=None, cloud=None, offset=0, limit=20):
         """
         List virtual machines
 
         :param deployment_id: Retrieve only virtual machines about the specified run_id. Default to None
         :type deployment_id: str or UUID
-        :param offset: Retrieve virtual machines starting by the offset<exp>th</exp> one. Default to 0
-        :param limit: Retrieve at most 'limit' virtual machines. Default to 20
 
+        :param cloud: Retrieve only virtual machines for the specified Cloud
+        :type cloud: str
+
+        :param offset: Retrieve virtual machines starting by the offset<exp>th</exp> one. Default to 0
+        :type offset: int
+
+        :param limit: Retrieve at most 'limit' virtual machines. Default to 20
+        :type limit: int
         """
+        _deployment_id = ''
         if deployment_id is not None:
             _deployment_id = str(deployment_id)
 
-        root = self._xml_get('/vms', offset=offset, limit=limit, runUuid=_deployment_id)
-        for elem in ElementTree__iter(root)('vm'):
+        _cloud = ''
+        if cloud is not None:
+            _cloud = cloud
+
+        root = self._xml_get('/vms', offset=offset, limit=limit, runUuid=_deployment_id, cloud=_cloud)
+        for elem in element_tree__iter(root)('vm'):
             run_id_str = elem.get('runUuid')
             run_id = uuid.UUID(run_id_str) if run_id_str is not None else None
             yield models.VirtualMachine(id=elem.get('instanceId'),
@@ -485,6 +919,8 @@ class Api(object):
                                         status=elem.get('state').lower(),
                                         deployment_id=run_id,
                                         deployment_owner=elem.get('runOwner'),
+                                        node_name=elem.get('nodeName'),
+                                        node_instance_id=elem.get('nodeInstanceId'),
                                         ip=elem.get('ip'),
                                         cpu=elem.get('cpu'),
                                         ram=elem.get('ram'),
@@ -528,17 +964,17 @@ class Api(object):
         :type parameters: dict
         :param tags: List of tags that can be used to identify or annotate a deployment
         :type tags: str or list
-        :param keep_running: [Only apply to applications] Define when to terminate or not a deployment when it reach the
+        :param keep_running: [Only applies to applications] Define when to terminate or not a deployment when it reach the
                              'Ready' state. Possibles values: 'always', 'never', 'on-success', 'on-error'.
                              If scalable is set to True, this value is ignored and it will behave as if it was set to 'always'.
                              If not specified the user default will be used.
         :type keep_running: 'always' or 'never' or 'on-success' or 'on-error'
-        :param scalable: [Only apply to applications] True to start a scalable deployment. Default: False
+        :param scalable: [Only applies to applications] True to start a scalable deployment. Default: False
         :type scalable: bool
-        :param multiplicity: [Only apply to applications] A dict to specify how many instances to start per node.
+        :param multiplicity: [Only applies to applications] A dict to specify how many instances to start per node.
                              Nodenames as keys and number of instances to start as values.
         :type multiplicity: dict
-        :param tolerate_failures: [Only apply to applications] A dict to specify how many failures to tolerate per node.
+        :param tolerate_failures: [Only applies to applications] A dict to specify how many failures to tolerate per node.
                                   Nodenames as keys and number of failure to tolerate as values.
         :type tolerate_failures: dict
         :param check_ssh_key: Set it to True if you want the SlipStream server to check if you have a public ssh key
@@ -557,7 +993,7 @@ class Api(object):
         _raw_params.update(self._convert_clouds_to_raw_params(cloud))
         _raw_params.update(self._convert_multiplicity_to_raw_params(multiplicity))
         _raw_params.update(self._convert_tolerate_failures_to_raw_params(tolerate_failures))
-        _raw_params['refqname'] = path
+        _raw_params['refqname'] = _mod_url(path)[1:]
 
         if tags:
             _raw_params['tags'] = tags if isinstance(tags, six.string_types) else ','.join(tags)
@@ -565,7 +1001,7 @@ class Api(object):
         if keep_running:
             if keep_running not in self.KEEP_RUNNING_VALUES:
                 raise ValueError('"keep_running" should be one of {}, not "{}"'.format(self.KEEP_RUNNING_VALUES,
-                                                                                     keep_running))
+                                                                                       keep_running))
             _raw_params['keep-running'] = keep_running
 
         if scalable:
@@ -596,12 +1032,63 @@ class Api(object):
         response.raise_for_status()
         return True
 
+    def add_node_instances(self, deployment_id, node_name, quantity=None):
+        """
+        Add new instance(s) of a deployment's node (horizontal scale up).
+
+        Warning: The targeted deployment has to be "scalable".
+
+        :param deployment_id: The deployment UUID of the deployment on which to add new instances of a node.
+        :type deployment_id: str|UUID
+        :param node_name: Name of the node where to add instances.
+        :type node_name: str
+        :param quantity: Amount of node instances to add. If not provided it's server dependent (usually add one instance)
+        :type quantity: int
+
+        :return: The list of new node instance names.
+        :rtype: list
+
+        """
+        url = '%s/run/%s/%s' % (self.endpoint, str(deployment_id), str(node_name))
+        data = {"n": quantity} if quantity else None
+
+        response = self.session.post(url, data=data)
+
+        response.raise_for_status()
+
+        return response.text.split(",")
+
+    def remove_node_instances(self, deployment_id, node_name, ids):
+        """
+        Remove a list of node instances from a deployment.
+
+        Warning: The targeted deployment has to be "scalable".
+
+        :param deployment_id: The deployment UUID of the deployment on which to remove instances of a node.
+        :type deployment_id: str|UUID
+        :param node_name: Name of the node where to remove instances.
+        :type node_name: str
+        :param ids: List of node instance ids to remove. Ids can also be provided as a CSV list.
+        :type ids: list|str
+
+        :return: True on success
+        :rtype: bool
+
+        """
+        url = '%s/run/%s/%s' % (self.endpoint, str(deployment_id), str(node_name))
+
+        response = self.session.delete(url, data={"ids": ",".join(str(id_) for id_ in ids)})
+
+        response.raise_for_status()
+
+        return response.status_code == 204
+
     def usage(self):
         """
         Get current usage and quota by cloud service.
         """
         root = self._xml_get('/dashboard')
-        for elem in ElementTree__iter(root)('cloudUsage'):
+        for elem in element_tree__iter(root)('cloudUsage'):
             yield models.Usage(cloud=elem.get('cloud'),
                                quota=int(elem.get('vmQuota')),
                                run_usage=int(elem.get('userRunUsage')),
@@ -708,5 +1195,8 @@ class Api(object):
 
         return raw_params
 
-
-
+    def get_cloud_credentials(self, cimi_filter=''):
+        filter = "type^='cloud-cred'"
+        if cimi_filter:
+            filter += 'and %s' % cimi_filter
+        return self.cimi_search(resource_type='credentials', filter=filter)
